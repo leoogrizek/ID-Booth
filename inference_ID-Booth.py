@@ -13,6 +13,7 @@ import json
 from diffusers import AutoPipelineForText2Image
 from itertools import product 
 from utils.sorting_utils import natural_keys
+from diffusers.loaders import LoraLoaderMixin
 
 backgrounds_list = ["","forest", "city street", "beach", "office", "bus", "laboratory", "factory", "construction site", "hospital", "night club"]
 backgrounds_list = [f"{b} background"  if b != "" else "" for b in backgrounds_list]#
@@ -50,8 +51,9 @@ guidance_scale = 5.0
 num_inference_steps = 30 
 
 folder_of_models = f"Trained_LoRA_Models" 
-models_to_test = ["DreamBooth", "PortraitBooth", "ID-Booth"]
-checkpoint =  "checkpoint-31-6400" 
+#models_to_test = ["DreamBooth", "PortraitBooth", "ID-Booth"]
+models_to_test = ["ID-Booth"]
+checkpoint =  "checkpoint-0-20" 
 
 folder_output = f"Generated_Samples/FacePortrait_Photo_21"  # _NonFinetuned
 if add_gender: folder_output += "_Gender"
@@ -60,7 +62,7 @@ if add_age: folder_output+= "_Age"
 if add_background: folder_output += "_Background"
 if do_not_use_negative_prompt: folder_output += "_NoNegPrompt"
 
-architectures = ["stabilityai/stable-diffusion-2-1-base"]
+architectures = ["sd2-community/stable-diffusion-2-1-base"]
 model_architecture = architectures[0]
 arch = model_architecture.split("/")[1]
 
@@ -83,6 +85,44 @@ original_prompt = f"face portrait photo of sks person"
 
 prompt = ""
 
+
+def convert_peft_lora_state_dict_for_legacy_diffusers(state_dict):
+    converted = {}
+
+    for key, value in state_dict.items():
+        key = key.replace("unet.base_model.model.", "unet.")
+        key = key.replace("text_encoder.base_model.model.", "text_encoder.")
+
+        if ".lora_A.weight" in key or ".lora_B.weight" in key:
+            up_or_down = "down" if ".lora_A.weight" in key else "up"
+            key = key.replace(".lora_A.weight", "")
+            key = key.replace(".lora_B.weight", "")
+            key = key.replace(".to_out.0", ".to_out")
+
+            if ".attn1." in key:
+                key = key.replace(".attn1.", ".attn1.processor.")
+            if ".attn2." in key:
+                key = key.replace(".attn2.", ".attn2.processor.")
+
+            key = f"{key}_lora.{up_or_down}.weight"
+
+        converted[key] = value
+
+    return converted
+
+
+def load_lora_weights_compat(pipe, model_path, weight_name="pytorch_lora_weights.safetensors"):
+    try:
+        pipe.load_lora_weights(model_path, weight_name=weight_name)
+        return
+    except Exception as error:
+        if "base_model" not in str(error):
+            raise
+
+    state_dict, _ = LoraLoaderMixin.lora_state_dict(model_path, weight_name=weight_name)
+    state_dict = convert_peft_lora_state_dict_for_legacy_diffusers(state_dict)
+    pipe.load_lora_weights(state_dict)
+
 for id_number, which_id in enumerate(ids):
     print("\n", which_id) 
 
@@ -104,7 +144,7 @@ for id_number, which_id in enumerate(ids):
         pipe.scheduler = DDPMScheduler.from_pretrained(model_architecture, subfolder="scheduler")
 
         if not use_non_finetuned:
-            pipe.load_lora_weights(full_model_path)
+            load_lora_weights_compat(pipe, full_model_path)
         pipe.set_progress_bar_config(disable=True)
         
         os.makedirs(output_dir, exist_ok=True)
