@@ -1,8 +1,8 @@
 numpy<1.26.0
 torch==2.1.2
 torchvision==0.16.2
-diffusers==0.32.2
+diffusers==0.20.2
 transformers==4.34.1
-peft
-accelerate
-facenet-pytorch
+peft==0.6.2
+accelerate==0.24.1
+facenet-pytorch==2.5.3
