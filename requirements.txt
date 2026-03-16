@@ -1,3 +1,6 @@
+--index-url https://download.pytorch.org/whl/cu118
+--extra-index-url https://pypi.org/simple
+
 numpy<1.26.0
 torch==2.1.2
 torchvision==0.16.2

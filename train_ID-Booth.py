@@ -32,7 +32,10 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
-from huggingface_hub.utils import insecure_hashlib
+try:
+    from huggingface_hub.utils import insecure_hashlib
+except ImportError:
+    import hashlib as insecure_hashlib
 from packaging import version
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
@@ -54,13 +57,26 @@ from diffusers import (
 )
 from diffusers.loaders import LoraLoaderMixin
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import _set_state_dict_into_text_encoder, cast_training_params
+try:
+    from diffusers.training_utils import _set_state_dict_into_text_encoder, cast_training_params
+except ImportError:
+    _set_state_dict_into_text_encoder = None
+
+    def cast_training_params(models, dtype=torch.float32):
+        if not isinstance(models, list):
+            models = [models]
+
+        for model in models:
+            if model is None:
+                continue
+
+            for param in model.parameters():
+                if param.requires_grad:
+                    param.data = param.data.to(dtype=dtype)
+
 from diffusers.utils import (
     check_min_version,
-    convert_state_dict_to_diffusers,
-    convert_unet_state_dict_to_peft,
 )
-from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
@@ -87,46 +103,6 @@ def dict_from_module(module):
             context[setting] = getattr(module, setting)
 
     return context
-
-def save_model_card(
-    repo_id: str,
-    images=None,
-    base_model=str,
-    train_text_encoder=False,
-    prompt=str,
-    repo_folder=None,
-    pipeline: DiffusionPipeline = None,
-):
-    img_str = ""
-    for i, image in enumerate(images):
-        image.save(os.path.join(repo_folder, f"image_{i}.png"))
-        img_str += f"![img_{i}](./image_{i}.png)\n"
-
-    model_description = f"""
-# LoRA DreamBooth - {repo_id}
-
-These are LoRA adaption weights for {base_model}. The weights were trained on {prompt} using [DreamBooth](https://dreambooth.github.io/). You can find some example images in the following. \n
-{img_str}
-
-LoRA for the text encoder was enabled: {train_text_encoder}.
-"""
-    model_card = load_or_create_model_card(
-        repo_id_or_path=repo_id,
-        from_training=True,
-        license="creativeml-openrail-m",
-        base_model=base_model,
-        prompt=prompt,
-        model_description=model_description,
-        inference=True,
-    )
-    tags = ["text-to-image", "diffusers", "lora", "diffusers-training"]
-    if isinstance(pipeline, StableDiffusionPipeline):
-        tags.extend(["stable-diffusion", "stable-diffusion-diffusers"])
-    else:
-        tags.extend(["if", "if-diffusers"])
-    model_card = populate_model_card(model_card, tags=tags)
-
-    model_card.save(os.path.join(repo_folder, "README.md"))
 
 
 def log_validation(
@@ -261,14 +237,33 @@ class DreamBoothDataset(Dataset):
         if not self.instance_data_root.exists():
             raise ValueError("Instance images root doesn't exists.")
 
-        self.instance_images_path = sorted(list(Path(instance_data_root).iterdir()))
+        image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+        def collect_files(root_dir, allowed_extensions=None):
+            files = []
+            for path in Path(root_dir).rglob("*"):
+                if not path.is_file():
+                    continue
+                if allowed_extensions is not None and path.suffix.lower() not in allowed_extensions:
+                    continue
+                files.append(path)
+            return sorted(files, key=lambda p: str(p))
+
+        self.instance_images_path = collect_files(self.instance_data_root, image_extensions)
         #self.instance_images_path.sort(key=natural_keys)
         #print("IMGS", self.instance_images_path)
         self.num_instance_images = len(self.instance_images_path)
         self.instance_prompt = instance_prompt
         self._length = self.num_instance_images
 
-        self.instance_identity_embeds_path = sorted(list(Path(instance_data_root.replace("images", "ArcFace_embeds")).iterdir()))
+        self.instance_identity_embeds_path = collect_files(Path(instance_data_root.replace("images", "ArcFace_embeds")))
+        if len(self.instance_images_path) == 0:
+            raise ValueError(f"No images found in instance_data_root: {self.instance_data_root}")
+        if len(self.instance_identity_embeds_path) < len(self.instance_images_path):
+            raise ValueError(
+                "Not enough instance ArcFace embeds. "
+                f"Found {len(self.instance_identity_embeds_path)} embeds for {len(self.instance_images_path)} images."
+            )
         
         
         #self.instance_identity_embeds_path.sort(key=natural_keys)
@@ -276,7 +271,7 @@ class DreamBoothDataset(Dataset):
         if class_data_root is not None:
             self.class_data_root = Path(class_data_root)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
-            self.class_images_path = list(self.class_data_root.iterdir())
+            self.class_images_path = collect_files(self.class_data_root, image_extensions)
             if class_num is not None:
                 self.num_class_images = min(len(self.class_images_path), class_num)
                 #print(".")
@@ -285,7 +280,14 @@ class DreamBoothDataset(Dataset):
                 
             self._length = max(self.num_class_images, self.num_instance_images)
             self.class_prompt = class_prompt
-            self.class_identity_embeds_path = sorted(list(Path(class_data_root.replace("images", "ArcFace_embeds")).iterdir()))
+            self.class_identity_embeds_path = collect_files(Path(class_data_root.replace("images", "ArcFace_embeds")))
+            if len(self.class_images_path) == 0:
+                raise ValueError(f"No class images found in class_data_root: {self.class_data_root}")
+            if len(self.class_identity_embeds_path) < self.num_class_images:
+                raise ValueError(
+                    "Not enough class ArcFace embeds. "
+                    f"Found {len(self.class_identity_embeds_path)} embeds for {self.num_class_images} class images."
+                )
         else:
             self.class_data_root = None
 
@@ -669,13 +671,15 @@ def main(args):
             text_encoder.gradient_checkpointing_enable()
 
     # now we will add new LoRA weights to the attention layers
+    from peft import get_peft_model
+
     unet_lora_config = LoraConfig(
         r=cfg.lora_rank,
         lora_alpha=cfg.lora_rank,
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
     )
-    unet.add_adapter(unet_lora_config)
+    unet = get_peft_model(unet, unet_lora_config)
 
     # The text encoder comes from 🤗 transformers, we will also attach adapters to it.
     if cfg.train_text_encoder:
@@ -685,12 +689,38 @@ def main(args):
             init_lora_weights="gaussian",
             target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
         )
-        text_encoder.add_adapter(text_lora_config)
+        text_encoder = get_peft_model(text_encoder, text_lora_config)
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
         model = model._orig_mod if is_compiled_module(model) else model
         return model
+
+    def unwrap_base_model(model):
+        model = unwrap_model(model)
+        if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+            return model.base_model.model
+        return model
+
+    def convert_peft_state_dict_for_diffusers(state_dict, model_prefix):
+        converted = {}
+        peft_prefix = f"{model_prefix}.base_model.model."
+        for key, value in state_dict.items():
+            if key.startswith(peft_prefix):
+                converted[f"{model_prefix}.{key[len(peft_prefix):]}"] = value
+            else:
+                converted[key] = value
+        return converted
+
+    def ensure_peft_prefix_for_loading(state_dict, model):
+        if not state_dict:
+            return state_dict
+        if not (hasattr(model, "base_model") and hasattr(model.base_model, "model")):
+            return state_dict
+        first_key = next(iter(state_dict.keys()))
+        if first_key.startswith("base_model.model."):
+            return state_dict
+        return {f"base_model.model.{k}": v for k, v in state_dict.items()}
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
@@ -702,10 +732,12 @@ def main(args):
 
             for model in models:
                 if isinstance(model, type(unwrap_model(unet))):
-                    unet_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
+                    unet_lora_layers_to_save = convert_peft_state_dict_for_diffusers(
+                        get_peft_model_state_dict(model), "unet"
+                    )
                 elif isinstance(model, type(unwrap_model(text_encoder))):
-                    text_encoder_lora_layers_to_save = convert_state_dict_to_diffusers(
-                        get_peft_model_state_dict(model)
+                    text_encoder_lora_layers_to_save = convert_peft_state_dict_for_diffusers(
+                        get_peft_model_state_dict(model), "text_encoder"
                     )
                 else:
                     raise ValueError(f"unexpected save model: {model.__class__}")
@@ -736,7 +768,7 @@ def main(args):
         lora_state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(input_dir)
 
         unet_state_dict = {f'{k.replace("unet.", "")}': v for k, v in lora_state_dict.items() if k.startswith("unet.")}
-        unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+        unet_state_dict = ensure_peft_prefix_for_loading(unet_state_dict, unet_)
         incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
 
         if incompatible_keys is not None:
@@ -749,6 +781,11 @@ def main(args):
                 )
 
         if cfg.train_text_encoder:
+            if _set_state_dict_into_text_encoder is None:
+                raise ImportError(
+                    "train_text_encoder=True requires a newer diffusers version with "
+                    "_set_state_dict_into_text_encoder available."
+                )
             _set_state_dict_into_text_encoder(lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_)
 
         # Make sure the trainable params are in float32. This is again needed since the base models
@@ -1210,8 +1247,8 @@ def main(args):
                 # create pipeline
                 pipeline = DiffusionPipeline.from_pretrained(
                     cfg.pretrained_model_name_or_path,
-                    unet=unwrap_model(unet),
-                    text_encoder=None if cfg.pre_compute_text_embeddings else unwrap_model(text_encoder),
+                    unet=unwrap_base_model(unet),
+                    text_encoder=None if cfg.pre_compute_text_embeddings else unwrap_base_model(text_encoder),
                     revision=cfg.revision,
                     variant=cfg.variant,
                     torch_dtype=weight_dtype,
@@ -1243,11 +1280,13 @@ def main(args):
         unet = unwrap_model(unet)
         unet = unet.to(torch.float32)
 
-        unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
+        unet_lora_state_dict = convert_peft_state_dict_for_diffusers(get_peft_model_state_dict(unet), "unet")
 
         if cfg.train_text_encoder:
             text_encoder = unwrap_model(text_encoder)
-            text_encoder_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder))
+            text_encoder_state_dict = convert_peft_state_dict_for_diffusers(
+                get_peft_model_state_dict(text_encoder), "text_encoder"
+            )
         else:
             text_encoder_state_dict = None
 
@@ -1264,11 +1303,19 @@ def main(args):
         )
 
         # load attention processors
-        pipeline.load_lora_weights(args.output_dir, weight_name="pytorch_lora_weights.safetensors")
+        lora_loaded_for_inference = True
+        try:
+            pipeline.load_lora_weights(args.output_dir, weight_name="pytorch_lora_weights.safetensors")
+        except Exception as error:
+            lora_loaded_for_inference = False
+            logger.warning(
+                "Skipping final LoRA inference load due to compatibility issue in this diffusers version: %s",
+                str(error),
+            )
 
         # run inference
         images = []
-        if cfg.validation_prompt and cfg.num_validation_images > 0:
+        if lora_loaded_for_inference and cfg.validation_prompt and cfg.num_validation_images > 0:
             pipeline_args = {"prompt": cfg.validation_prompt, "num_inference_steps": 30}
             images = log_validation(
                 pipeline,
