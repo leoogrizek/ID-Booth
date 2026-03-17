@@ -1,4 +1,4 @@
-pretrained_model_name_or_path = "sd2-community/stable-diffusion-2-1-base"
+pretrained_model_name_or_path = "black-forest-labs/FLUX.1-dev"
 
 mixed_precision = "fp16"
 logging_dir = "Logs"
@@ -46,7 +46,7 @@ seed = 0
 lora_rank = 4
 train_batch_size = 1
 gradient_accumulation_steps = 1
-gradient_checkpointing = False
+gradient_checkpointing = True
 
 num_train_epochs = 1
 validation_epochs = 1
@@ -69,6 +69,23 @@ lr_power = 1.0
 
 train_text_encoder = False
 pre_compute_text_embeddings = False
+
+# FLUX conditioning / inference controls
+max_sequence_length = 512
+guidance_scale = 3.5
+validation_num_inference_steps = 28
+
+# FLUX inference memory controls (used for validation and final sampling)
+inference_quantize_transformer_nf4 = True
+inference_model_cpu_offload = True
+inference_sequential_cpu_offload = False
+inference_vae_tiling = True
+inference_vae_slicing = True
+
+# Optional Redux reference-image conditioning for validation/final sampling
+inference_use_redux = False
+redux_model_name_or_path = "black-forest-labs/FLUX.1-Redux-dev"
+validation_reference_image = None
 
 losses_to_test = ["triplet_prior"]
 timestep_loss_weighting = True

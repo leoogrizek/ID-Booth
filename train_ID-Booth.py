@@ -37,31 +37,38 @@ try:
 except ImportError:
     import hashlib as insecure_hashlib
 from packaging import version
-from peft import LoraConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
-
 import diffusers
 from diffusers import (
     AutoencoderKL,
-    DDPMScheduler,
-    DiffusionPipeline,
-    DPMSolverMultistepScheduler,
-    StableDiffusionPipeline,
-    UNet2DConditionModel,
+    FlowMatchEulerDiscreteScheduler,
+    FluxPipeline,
+    FluxTransformer2DModel,
 )
-from diffusers.loaders import LoraLoaderMixin
+try:
+    from diffusers import FluxPriorReduxPipeline
+except ImportError:
+    FluxPriorReduxPipeline = None
+try:
+    from diffusers import BitsAndBytesConfig
+except ImportError:
+    try:
+        from diffusers.quantizers.quantization_config import BitsAndBytesConfig
+    except Exception:
+        try:
+            from transformers import BitsAndBytesConfig
+        except Exception:
+            BitsAndBytesConfig = None
 from diffusers.optimization import get_scheduler
 try:
-    from diffusers.training_utils import _set_state_dict_into_text_encoder, cast_training_params
+    from diffusers.training_utils import cast_training_params
 except ImportError:
-    _set_state_dict_into_text_encoder = None
-
     def cast_training_params(models, dtype=torch.float32):
         if not isinstance(models, list):
             models = [models]
@@ -76,8 +83,8 @@ except ImportError:
 
 from diffusers.utils import (
     check_min_version,
+    convert_unet_state_dict_to_peft,
 )
-from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
 from ArcFace_files.ArcFace_functions import preprocess_image_for_ArcFace, prepare_locked_ArcFace_model
@@ -117,45 +124,41 @@ def log_validation(
         f"Running validation... \n Generating {cfg.num_validation_images} images with prompt:"
         f" {cfg.validation_prompt}."
     )
-    # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
-    scheduler_args = {}
-
-    if "variance_type" in pipeline.scheduler.config:
-        variance_type = pipeline.scheduler.config.variance_type
-
-        if variance_type in ["learned", "learned_range"]:
-            variance_type = "fixed_small"
-
-        scheduler_args["variance_type"] = variance_type
-
-    pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config, **scheduler_args)
-
-    pipeline = pipeline.to(accelerator.device)
+    use_inference_offload = bool(
+        getattr(cfg, "inference_model_cpu_offload", False)
+        or getattr(cfg, "inference_sequential_cpu_offload", False)
+    )
+    if not use_inference_offload:
+        pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
     # run inference
-    generator = torch.Generator(device=accelerator.device).manual_seed(cfg.seed) if cfg.seed else None
+    generator_device = "cpu" if use_inference_offload else accelerator.device
+    generator = torch.Generator(device=generator_device).manual_seed(cfg.seed) if cfg.seed else None
 
     phase_name = "test" if is_final_validation else "validation"
-    # if cfg.validation_images is None:
     images = []
+    is_flux = isinstance(pipeline, FluxPipeline)
     for i in range(cfg.num_validation_images):
-        with torch.cuda.amp.autocast():
-            image = pipeline(**pipeline_args, generator=generator).images[0]
+        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            if is_flux:
+                image = pipeline(
+                    **pipeline_args,
+                    generator=generator,
+                    height=cfg.resolution,
+                    width=cfg.resolution,
+                    num_inference_steps=getattr(cfg, "validation_num_inference_steps", 28),
+                    guidance_scale=getattr(cfg, "guidance_scale", 3.5),
+                    max_sequence_length=getattr(cfg, "max_sequence_length", 512),
+                ).images[0]
+            else:
+                image = pipeline(**pipeline_args, generator=generator).images[0]
             images.append(image)
             folder_path = os.path.join(args.output_dir, phase_name)
             os.makedirs(folder_path,exist_ok=True)
             image_filename = f"{folder_path}/{epoch}_validation_img_{i}.jpg"
             image.save(image_filename)
 
-    # else:
-    #     images = []
-    #     for image in cfg.validation_images:
-    #         image = Image.open(image)
-    #         with torch.cuda.amp.autocast():
-    #             image = pipeline(**pipeline_args, image=image, generator=generator).images[0]
-    #         images.append(image)
-            
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
@@ -167,32 +170,136 @@ def log_validation(
     return images
 
 
-def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
-    text_encoder_config = PretrainedConfig.from_pretrained(
-        pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=revision,
+def build_flux_inference_pipeline(accelerator, weight_dtype, lora_dir=None, lora_weight_name=None):
+    inference_quantize_transformer_nf4 = getattr(cfg, "inference_quantize_transformer_nf4", True)
+    inference_model_cpu_offload = getattr(cfg, "inference_model_cpu_offload", True)
+    inference_sequential_cpu_offload = getattr(cfg, "inference_sequential_cpu_offload", False)
+    inference_vae_tiling = getattr(cfg, "inference_vae_tiling", True)
+    inference_vae_slicing = getattr(cfg, "inference_vae_slicing", True)
+
+    transformer = None
+    if inference_quantize_transformer_nf4:
+        if BitsAndBytesConfig is None:
+            raise ImportError("BitsAndBytesConfig is required for inference_quantize_transformer_nf4=True")
+        nf4_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=weight_dtype,
+        )
+        transformer = FluxTransformer2DModel.from_pretrained(
+            cfg.pretrained_model_name_or_path,
+            subfolder="transformer",
+            revision=cfg.revision,
+            variant=cfg.variant,
+            quantization_config=nf4_config,
+            torch_dtype=weight_dtype,
+        )
+
+    pipeline = FluxPipeline.from_pretrained(
+        cfg.pretrained_model_name_or_path,
+        transformer=transformer,
+        text_encoder=None,
+        text_encoder_2=None,
+        revision=cfg.revision,
+        variant=cfg.variant,
+        torch_dtype=weight_dtype,
     )
-    model_class = text_encoder_config.architectures[0]
 
-    if model_class == "CLIPTextModel":
-        from transformers import CLIPTextModel
+    if lora_dir is not None:
+        load_kwargs = {}
+        if lora_weight_name is not None:
+            load_kwargs["weight_name"] = lora_weight_name
+        pipeline.load_lora_weights(lora_dir, **load_kwargs)
 
-        return CLIPTextModel
-    elif model_class == "RobertaSeriesModelWithTransformation":
-        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+    if inference_vae_slicing and hasattr(pipeline, "vae") and pipeline.vae is not None:
+        pipeline.vae.enable_slicing()
+    if inference_vae_tiling and hasattr(pipeline, "vae") and pipeline.vae is not None:
+        pipeline.vae.enable_tiling()
 
-        return RobertaSeriesModelWithTransformation
-    elif model_class == "T5EncoderModel":
-        from transformers import T5EncoderModel
-
-        return T5EncoderModel
+    if inference_model_cpu_offload:
+        pipeline.enable_model_cpu_offload()
+    elif inference_sequential_cpu_offload:
+        pipeline.enable_sequential_cpu_offload()
     else:
-        raise ValueError(f"{model_class} is not supported.")
+        pipeline.to(accelerator.device)
+
+    return pipeline
+
+
+def configure_flux_inference_memory(pipeline, accelerator):
+    inference_model_cpu_offload = getattr(cfg, "inference_model_cpu_offload", True)
+    inference_sequential_cpu_offload = getattr(cfg, "inference_sequential_cpu_offload", False)
+    inference_vae_tiling = getattr(cfg, "inference_vae_tiling", True)
+    inference_vae_slicing = getattr(cfg, "inference_vae_slicing", True)
+
+    if inference_vae_slicing and hasattr(pipeline, "vae") and pipeline.vae is not None:
+        pipeline.vae.enable_slicing()
+    if inference_vae_tiling and hasattr(pipeline, "vae") and pipeline.vae is not None:
+        pipeline.vae.enable_tiling()
+
+    if inference_model_cpu_offload:
+        pipeline.enable_model_cpu_offload()
+    elif inference_sequential_cpu_offload:
+        pipeline.enable_sequential_cpu_offload()
+    else:
+        pipeline.to(accelerator.device)
+
+
+def prepare_flux_validation_kwargs(validation_flux_prompt, accelerator, weight_dtype):
+    use_inference_offload = bool(
+        getattr(cfg, "inference_model_cpu_offload", False)
+        or getattr(cfg, "inference_sequential_cpu_offload", False)
+    )
+    inference_device = torch.device("cpu") if use_inference_offload else accelerator.device
+    pipeline_args = {
+        "prompt_embeds": validation_flux_prompt["prompt_embeds"].to(device=inference_device, dtype=weight_dtype),
+        "pooled_prompt_embeds": validation_flux_prompt["pooled_prompt_embeds"].to(
+            device=inference_device, dtype=weight_dtype
+        ),
+    }
+
+    if getattr(cfg, "inference_use_redux", False):
+        validation_reference_image = getattr(cfg, "validation_reference_image", None)
+        if FluxPriorReduxPipeline is None:
+            logger.warning("inference_use_redux=True but FluxPriorReduxPipeline is unavailable. Falling back to text-only validation.")
+            return pipeline_args
+        if not validation_reference_image:
+            logger.warning("inference_use_redux=True but validation_reference_image is not set. Falling back to text-only validation.")
+            return pipeline_args
+
+        redux_prior = FluxPriorReduxPipeline.from_pretrained(
+            getattr(cfg, "redux_model_name_or_path", "black-forest-labs/FLUX.1-Redux-dev"),
+            torch_dtype=weight_dtype,
+        )
+        if getattr(cfg, "inference_model_cpu_offload", True) or getattr(cfg, "inference_sequential_cpu_offload", False):
+            redux_prior.enable_model_cpu_offload()
+        else:
+            redux_prior.to(accelerator.device)
+
+        reference = Image.open(validation_reference_image).convert("RGB")
+        prior_output = redux_prior(reference, prompt=cfg.validation_prompt)
+        pipeline_args.update(prior_output)
+        del redux_prior
+
+    return pipeline_args
+
+
+def convert_peft_state_dict_for_flux(state_dict):
+    converted = {}
+    peft_prefix = "base_model.model."
+    for key, value in state_dict.items():
+        stripped_key = key[len(peft_prefix):] if key.startswith(peft_prefix) else key
+        converted[f"transformer.{stripped_key}"] = value
+    return converted
 
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser.add_argument(
+        "--test_run",
+        action="store_true",
+        help="Run a short smoke test: 1 epoch on 1 identity subfolder.",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -225,6 +332,12 @@ class DreamBoothDataset(Dataset):
         encoder_hidden_states=None,
         class_prompt_encoder_hidden_states=None,
         tokenizer_max_length=None,
+        flux_prompt_embeds=None,
+        flux_pooled_prompt_embeds=None,
+        flux_text_ids=None,
+        class_flux_prompt_embeds=None,
+        class_flux_pooled_prompt_embeds=None,
+        class_flux_text_ids=None,
     ):
         self.size = size
         self.center_crop = center_crop
@@ -232,6 +345,12 @@ class DreamBoothDataset(Dataset):
         self.encoder_hidden_states = encoder_hidden_states
         self.class_prompt_encoder_hidden_states = class_prompt_encoder_hidden_states
         self.tokenizer_max_length = tokenizer_max_length
+        self.flux_prompt_embeds = flux_prompt_embeds
+        self.flux_pooled_prompt_embeds = flux_pooled_prompt_embeds
+        self.flux_text_ids = flux_text_ids
+        self.class_flux_prompt_embeds = class_flux_prompt_embeds
+        self.class_flux_pooled_prompt_embeds = class_flux_pooled_prompt_embeds
+        self.class_flux_text_ids = class_flux_text_ids
 
         self.instance_data_root = Path(instance_data_root)
         if not self.instance_data_root.exists():
@@ -313,7 +432,11 @@ class DreamBoothDataset(Dataset):
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
 
-        if self.encoder_hidden_states is not None:
+        if self.flux_prompt_embeds is not None:
+            example["instance_prompt_embeds"] = self.flux_prompt_embeds
+            example["instance_pooled_prompt_embeds"] = self.flux_pooled_prompt_embeds
+            example["instance_text_ids"] = self.flux_text_ids
+        elif self.encoder_hidden_states is not None:
             example["instance_prompt_ids"] = self.encoder_hidden_states
         else:
             text_inputs = tokenize_prompt(
@@ -335,7 +458,11 @@ class DreamBoothDataset(Dataset):
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
 
-            if self.class_prompt_encoder_hidden_states is not None:
+            if self.class_flux_prompt_embeds is not None:
+                example["class_prompt_embeds"] = self.class_flux_prompt_embeds
+                example["class_pooled_prompt_embeds"] = self.class_flux_pooled_prompt_embeds
+                example["class_text_ids"] = self.class_flux_text_ids
+            elif self.class_prompt_encoder_hidden_states is not None:
                 example["class_prompt_ids"] = self.class_prompt_encoder_hidden_states
             else:
                 class_text_inputs = tokenize_prompt(
@@ -354,11 +481,18 @@ class DreamBoothDataset(Dataset):
 
 
 def collate_fn(examples, with_prior_preservation=False):
+    has_flux_embeddings = "instance_prompt_embeds" in examples[0]
     has_attention_mask = "instance_attention_mask" in examples[0]
 
-    input_ids = [example["instance_prompt_ids"] for example in examples]
     pixel_values = [example["instance_images"] for example in examples]
     identity_embed = [example["instance_identity_embeds"] for example in examples]
+
+    if has_flux_embeddings:
+        prompt_embeds = [example["instance_prompt_embeds"] for example in examples]
+        pooled_prompt_embeds = [example["instance_pooled_prompt_embeds"] for example in examples]
+        text_ids = [example["instance_text_ids"] for example in examples]
+    else:
+        input_ids = [example["instance_prompt_ids"] for example in examples]
 
     if has_attention_mask:
         attention_mask = [example["instance_attention_mask"] for example in examples]
@@ -366,8 +500,13 @@ def collate_fn(examples, with_prior_preservation=False):
     # Concat class and instance examples for prior preservation.
     # We do this to avoid doing two forward passes.
     if with_prior_preservation:
-        input_ids += [example["class_prompt_ids"] for example in examples]
         pixel_values += [example["class_images"] for example in examples]
+        if has_flux_embeddings:
+            prompt_embeds += [example["class_prompt_embeds"] for example in examples]
+            pooled_prompt_embeds += [example["class_pooled_prompt_embeds"] for example in examples]
+            text_ids += [example["class_text_ids"] for example in examples]
+        else:
+            input_ids += [example["class_prompt_ids"] for example in examples]
         if has_attention_mask:
             attention_mask += [example["class_attention_mask"] for example in examples]
 
@@ -376,14 +515,19 @@ def collate_fn(examples, with_prior_preservation=False):
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    input_ids = torch.cat(input_ids, dim=0)
     identity_embed = torch.cat(identity_embed, dim=0)
-    
+
     batch = {
-        "input_ids": input_ids,
         "pixel_values": pixel_values,
         "identity_embed": identity_embed,
     }
+
+    if has_flux_embeddings:
+        batch["prompt_embeds"] = torch.stack(prompt_embeds).squeeze(1)
+        batch["pooled_prompt_embeds"] = torch.stack(pooled_prompt_embeds).squeeze(1)
+        batch["text_ids"] = torch.stack(text_ids)[0]
+    else:
+        batch["input_ids"] = torch.cat(input_ids, dim=0)
 
     if has_attention_mask:
         batch["attention_mask"] = attention_mask
@@ -409,7 +553,9 @@ class PromptDataset(Dataset):
 
 def latents_to_pil_images(latents, vae):
     # bath of latents -> list of images
-    latents = (1 / 0.18215) * latents
+    scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
+    shift_factor = getattr(vae.config, "shift_factor", 0.0)
+    latents = (latents / scaling_factor) + shift_factor
     with torch.no_grad():
         image = vae.decode(latents).sample
     image = (image / 2 + 0.5).clamp(0, 1)
@@ -434,7 +580,9 @@ def reverse_normalized_image(img, multiply_255=True):
 
 def latents_to_image_for_mtcnn(latents, vae):
     # batch of latents -> list of images
-    latents = (1 / 0.18215) * latents
+    scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
+    shift_factor = getattr(vae.config, "shift_factor", 0.0)
+    latents = (latents / scaling_factor) + shift_factor
     # decode with the pretrained VAE
     image = vae.decode(latents).sample #[0]
     # Transform to image range ... TODO denormalize? 
@@ -493,6 +641,29 @@ def encode_prompt(text_encoder, input_ids, attention_mask, text_encoder_use_atte
     return prompt_embeds
 
 
+@torch.no_grad()
+def encode_prompt_for_flux(prompt_encoder_pipeline, prompt, device, max_sequence_length):
+    prompt_embeds, pooled_prompt_embeds, text_ids = prompt_encoder_pipeline.encode_prompt(
+        prompt=prompt,
+        prompt_2=prompt,
+        device=device,
+        max_sequence_length=max_sequence_length,
+    )
+    return {
+        "prompt_embeds": prompt_embeds.detach().cpu(),
+        "pooled_prompt_embeds": pooled_prompt_embeds.detach().cpu(),
+        "text_ids": text_ids.detach().cpu(),
+    }
+
+
+def unpack_flux_latents(latents, latent_height, latent_width):
+    batch_size, _, channels = latents.shape
+    latents = latents.view(batch_size, latent_height // 2, latent_width // 2, channels // 4, 2, 2)
+    latents = latents.permute(0, 3, 1, 4, 2, 5)
+    latents = latents.reshape(batch_size, channels // 4, latent_height, latent_width)
+    return latents
+
+
 
 def contrastive_loss(x1, x2, label, margin: float = 1.0):
     dist = torch.nn.functional.pairwise_distance(x1, x2)
@@ -519,14 +690,9 @@ def main(args):
     
     print(accelerator)
 
-    # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
-    # This will be enabled soon in accelerate. For now, we don't allow gradient accumulation when training two models.
-    # TODO (sayakpaul): Remove this check when gradient accumulation with two models is enabled in accelerate.
-    if cfg.train_text_encoder and cfg.gradient_accumulation_steps > 1 and accelerator.num_processes > 1:
-        raise ValueError(
-            "Gradient accumulation is not supported when training the text encoder in distributed training. "
-            "Please set gradient_accumulation_steps to 1. This feature will be supported in the future."
-        )
+    if cfg.train_text_encoder:
+        logger.warning("FLUX QLoRA mode does not support text encoder training in this pipeline. Forcing train_text_encoder=False.")
+        cfg.train_text_encoder = False
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -561,10 +727,9 @@ def main(args):
                 torch_dtype = torch.float16
             elif cfg.prior_generation_precision == "bf16":
                 torch_dtype = torch.bfloat16
-            pipeline = DiffusionPipeline.from_pretrained(
+            pipeline = FluxPipeline.from_pretrained(
                 cfg.pretrained_model_name_or_path,
                 torch_dtype=torch_dtype,
-                safety_checker=None,
                 revision=cfg.revision,
                 variant=cfg.variant,
             )
@@ -582,7 +747,14 @@ def main(args):
             for example in tqdm(
                 sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
             ):
-                images = pipeline(example["prompt"]).images
+                images = pipeline(
+                    example["prompt"],
+                    height=cfg.resolution,
+                    width=cfg.resolution,
+                    num_inference_steps=getattr(cfg, "validation_num_inference_steps", 28),
+                    guidance_scale=getattr(cfg, "guidance_scale", 3.5),
+                    max_sequence_length=getattr(cfg, "max_sequence_length", 512),
+                ).images
 
                 for i, image in enumerate(images):
                     hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
@@ -598,45 +770,44 @@ def main(args):
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load the tokenizer
-    if cfg.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name, revision=cfg.revision, use_fast=False)
-    elif cfg.pretrained_model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.pretrained_model_name_or_path,
-            subfolder="tokenizer",
-            revision=cfg.revision,
-            use_fast=False,
-        )
-
-    # import correct text encoder class
     print("Model path:", cfg.pretrained_model_name_or_path)
-    text_encoder_cls = import_model_class_from_model_name_or_path(cfg.pretrained_model_name_or_path, cfg.revision)
-
-    # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(cfg.pretrained_model_name_or_path, subfolder="scheduler")
-    text_encoder = text_encoder_cls.from_pretrained(
-        cfg.pretrained_model_name_or_path, subfolder="text_encoder", revision=cfg.revision, variant=cfg.variant
+    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        cfg.pretrained_model_name_or_path, subfolder="scheduler"
     )
-    try:
-        vae = AutoencoderKL.from_pretrained(
-            cfg.pretrained_model_name_or_path, subfolder="vae", revision=cfg.revision, variant=cfg.variant
+    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
+    vae = AutoencoderKL.from_pretrained(
+        cfg.pretrained_model_name_or_path, subfolder="vae", revision=cfg.revision, variant=cfg.variant
+    )
+
+    bnb_4bit_compute_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        bnb_4bit_compute_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        bnb_4bit_compute_dtype = torch.bfloat16
+
+    if BitsAndBytesConfig is None:
+        raise ImportError(
+            "BitsAndBytesConfig is not available in this environment. "
+            "Install a newer diffusers (recommended >= 0.31) or a compatible transformers/bitsandbytes stack."
         )
-    except OSError:
-        # IF does not have a VAE so let's just set it to None
-        # We don't have to error out here
-        vae = None
 
-    unet = UNet2DConditionModel.from_pretrained(
-        cfg.pretrained_model_name_or_path, subfolder="unet", revision=cfg.revision, variant=cfg.variant
+    nf4_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
     )
+    transformer = FluxTransformer2DModel.from_pretrained(
+        cfg.pretrained_model_name_or_path,
+        subfolder="transformer",
+        revision=cfg.revision,
+        variant=cfg.variant,
+        quantization_config=nf4_config,
+        torch_dtype=bnb_4bit_compute_dtype,
+    )
+    transformer = prepare_model_for_kbit_training(transformer, use_gradient_checkpointing=False)
 
-    # We only train the additional adapter LoRA layers
-    if vae is not None:
-        vae.requires_grad_(False)
-    # TODO ... DEBUGGING: set vae to train as well 
-    text_encoder.requires_grad_(False)
-    unet.requires_grad_(False)
+    vae.requires_grad_(False)
+    transformer.requires_grad_(False)
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -646,130 +817,66 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # Move unet, vae and text_encoder to device and cast to weight_dtype
-    unet.to(accelerator.device, dtype=weight_dtype)
-    if vae is not None:
-        vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
-
-    if cfg.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            import xformers
-
-            xformers_version = version.parse(xformers.__version__)
-            if xformers_version == version.parse("0.0.16"):
-                logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                )
-            unet.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
+    vae.to(accelerator.device, dtype=weight_dtype)
 
     if cfg.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
-        if cfg.train_text_encoder:
-            text_encoder.gradient_checkpointing_enable()
+        transformer.enable_gradient_checkpointing()
 
-    # now we will add new LoRA weights to the attention layers
-    from peft import get_peft_model
-
-    unet_lora_config = LoraConfig(
+    transformer_lora_config = LoraConfig(
         r=cfg.lora_rank,
         lora_alpha=cfg.lora_rank,
         init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
-    unet = get_peft_model(unet, unet_lora_config)
-
-    # The text encoder comes from 🤗 transformers, we will also attach adapters to it.
-    if cfg.train_text_encoder:
-        text_lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=cfg.lora_rank,
-            init_lora_weights="gaussian",
-            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
-        )
-        text_encoder = get_peft_model(text_encoder, text_lora_config)
+    transformer = get_peft_model(transformer, transformer_lora_config)
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
         model = model._orig_mod if is_compiled_module(model) else model
         return model
 
-    def unwrap_base_model(model):
-        model = unwrap_model(model)
-        if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
-            return model.base_model.model
-        return model
-
-    def convert_peft_state_dict_for_diffusers(state_dict, model_prefix):
-        converted = {}
-        peft_prefix = f"{model_prefix}.base_model.model."
-        for key, value in state_dict.items():
-            if key.startswith(peft_prefix):
-                converted[f"{model_prefix}.{key[len(peft_prefix):]}"] = value
-            else:
-                converted[key] = value
-        return converted
-
-    def ensure_peft_prefix_for_loading(state_dict, model):
-        if not state_dict:
-            return state_dict
-        if not (hasattr(model, "base_model") and hasattr(model.base_model, "model")):
-            return state_dict
-        first_key = next(iter(state_dict.keys()))
-        if first_key.startswith("base_model.model."):
-            return state_dict
-        return {f"base_model.model.{k}": v for k, v in state_dict.items()}
-
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
         if accelerator.is_main_process:
-            # there are only two options here. Either are just the unet attn processor layers
-            # or there are the unet and text encoder atten layers
-            unet_lora_layers_to_save = None
-            text_encoder_lora_layers_to_save = None
+            transformer_lora_layers_to_save = None
 
             for model in models:
-                if isinstance(model, type(unwrap_model(unet))):
-                    unet_lora_layers_to_save = convert_peft_state_dict_for_diffusers(
-                        get_peft_model_state_dict(model), "unet"
-                    )
-                elif isinstance(model, type(unwrap_model(text_encoder))):
-                    text_encoder_lora_layers_to_save = convert_peft_state_dict_for_diffusers(
-                        get_peft_model_state_dict(model), "text_encoder"
-                    )
+                if isinstance(model, type(unwrap_model(transformer))):
+                    model = unwrap_model(model)
+                    transformer_lora_layers_to_save = convert_peft_state_dict_for_flux(get_peft_model_state_dict(model))
                 else:
                     raise ValueError(f"unexpected save model: {model.__class__}")
 
                 # make sure to pop weight so that corresponding model is not saved again
-                weights.pop()
+                if weights:
+                    weights.pop()
 
-            LoraLoaderMixin.save_lora_weights(
+            FluxPipeline.save_lora_weights(
                 output_dir,
-                unet_lora_layers=unet_lora_layers_to_save,
-                text_encoder_lora_layers=text_encoder_lora_layers_to_save,
+                transformer_lora_layers=transformer_lora_layers_to_save,
+                text_encoder_lora_layers=None,
             )
 
     def load_model_hook(models, input_dir):
-        unet_ = None
-        text_encoder_ = None
+        transformer_ = None
 
         while len(models) > 0:
             model = models.pop()
 
-            if isinstance(model, type(unwrap_model(unet))):
-                unet_ = model
-            elif isinstance(model, type(unwrap_model(text_encoder))):
-                text_encoder_ = model
+            if isinstance(model, type(unwrap_model(transformer))):
+                transformer_ = model
             else:
                 raise ValueError(f"unexpected save model: {model.__class__}")
 
-        lora_state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(input_dir)
+        lora_state_dict = FluxPipeline.lora_state_dict(input_dir)
+        if isinstance(lora_state_dict, tuple):
+            lora_state_dict = lora_state_dict[0]
 
-        unet_state_dict = {f'{k.replace("unet.", "")}': v for k, v in lora_state_dict.items() if k.startswith("unet.")}
-        unet_state_dict = ensure_peft_prefix_for_loading(unet_state_dict, unet_)
-        incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
+        transformer_state_dict = {
+            f"{k.replace('transformer.', '')}": v for k, v in lora_state_dict.items() if k.startswith("transformer.")
+        }
+        transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
+        incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
 
         if incompatible_keys is not None:
             # check only for unexpected keys
@@ -780,23 +887,8 @@ def main(args):
                     f" {unexpected_keys}. "
                 )
 
-        if cfg.train_text_encoder:
-            if _set_state_dict_into_text_encoder is None:
-                raise ImportError(
-                    "train_text_encoder=True requires a newer diffusers version with "
-                    "_set_state_dict_into_text_encoder available."
-                )
-            _set_state_dict_into_text_encoder(lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_)
-
-        # Make sure the trainable params are in float32. This is again needed since the base models
-        # are in `weight_dtype`. More details:
-        # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
         if cfg.mixed_precision == "fp16":
-            models = [unet_]
-            if cfg.train_text_encoder:
-                models.append(text_encoder_)
-
-            # only upcast trainable parameters (LoRA) into fp32
+            models = [transformer_]
             cast_training_params(models, dtype=torch.float32)
 
     accelerator.register_save_state_pre_hook(save_model_hook)
@@ -814,11 +906,7 @@ def main(args):
 
     # Make sure the trainable params are in float32.
     if cfg.mixed_precision == "fp16":
-        models = [unet]
-        if cfg.train_text_encoder:
-            models.append(text_encoder)
-
-        # only upcast trainable parameters (LoRA) into fp32
+        models = [transformer]
         cast_training_params(models, dtype=torch.float32)
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
@@ -834,10 +922,7 @@ def main(args):
     else:
         optimizer_class = torch.optim.AdamW
 
-    # Optimizer creation
-    params_to_optimize = list(filter(lambda p: p.requires_grad, unet.parameters()))
-    if cfg.train_text_encoder:
-        params_to_optimize = params_to_optimize + list(filter(lambda p: p.requires_grad, text_encoder.parameters()))
+    params_to_optimize = list(filter(lambda p: p.requires_grad, transformer.parameters()))
 
     optimizer = optimizer_class(
         params_to_optimize,
@@ -847,43 +932,46 @@ def main(args):
         eps=cfg.adam_epsilon,
     )
 
-    if cfg.pre_compute_text_embeddings:
+    cfg.pre_compute_text_embeddings = True
+    prompt_encoder_device = torch.device("cpu")
+    prompt_encoder_pipeline = FluxPipeline.from_pretrained(
+        cfg.pretrained_model_name_or_path,
+        transformer=None,
+        vae=None,
+        revision=cfg.revision,
+        variant=cfg.variant,
+        torch_dtype=torch.float32,
+    )
 
-        def compute_text_embeddings(prompt):
-            with torch.no_grad():
-                text_inputs = tokenize_prompt(tokenizer, prompt, tokenizer_max_length=cfg.tokenizer_max_length)
-                prompt_embeds = encode_prompt(
-                    text_encoder,
-                    text_inputs.input_ids,
-                    text_inputs.attention_mask,
-                    text_encoder_use_attention_mask=cfg.text_encoder_use_attention_mask,
-                )
-
-            return prompt_embeds
-
-        pre_computed_encoder_hidden_states = compute_text_embeddings(cfg.instance_prompt)
-        validation_prompt_negative_prompt_embeds = compute_text_embeddings("")
-
-        if cfg.validation_prompt is not None:
-            validation_prompt_encoder_hidden_states = compute_text_embeddings(cfg.validation_prompt)
-        else:
-            validation_prompt_encoder_hidden_states = None
-
-        if cfg.class_prompt is not None:
-            pre_computed_class_prompt_encoder_hidden_states = compute_text_embeddings(cfg.class_prompt)
-        else:
-            pre_computed_class_prompt_encoder_hidden_states = None
-
-        text_encoder = None
-        tokenizer = None
-        
-        gc.collect()
-        torch.cuda.empty_cache()
+    precomputed_flux_instance = encode_prompt_for_flux(
+        prompt_encoder_pipeline,
+        cfg.instance_prompt,
+        prompt_encoder_device,
+        max_sequence_length=getattr(cfg, "max_sequence_length", 512),
+    )
+    if cfg.validation_prompt is not None:
+        validation_flux_prompt = encode_prompt_for_flux(
+            prompt_encoder_pipeline,
+            cfg.validation_prompt,
+            prompt_encoder_device,
+            max_sequence_length=getattr(cfg, "max_sequence_length", 512),
+        )
     else:
-        pre_computed_encoder_hidden_states = None
-        validation_prompt_encoder_hidden_states = None
-        validation_prompt_negative_prompt_embeds = None
-        pre_computed_class_prompt_encoder_hidden_states = None
+        validation_flux_prompt = None
+
+    if cfg.class_prompt is not None:
+        precomputed_flux_class = encode_prompt_for_flux(
+            prompt_encoder_pipeline,
+            cfg.class_prompt,
+            prompt_encoder_device,
+            max_sequence_length=getattr(cfg, "max_sequence_length", 512),
+        )
+    else:
+        precomputed_flux_class = None
+
+    del prompt_encoder_pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(
@@ -892,12 +980,17 @@ def main(args):
         class_data_root=cfg.class_data_dir if cfg.with_prior_preservation else None,
         class_prompt=cfg.class_prompt,
         class_num=cfg.num_class_images,
-        tokenizer=tokenizer,
+        tokenizer=None,
         size=cfg.resolution,
-        #center_crop=cfg.center_crop,
-        encoder_hidden_states=pre_computed_encoder_hidden_states,
-        class_prompt_encoder_hidden_states=pre_computed_class_prompt_encoder_hidden_states,
-        tokenizer_max_length=cfg.tokenizer_max_length,
+        encoder_hidden_states=None,
+        class_prompt_encoder_hidden_states=None,
+        tokenizer_max_length=None,
+        flux_prompt_embeds=precomputed_flux_instance["prompt_embeds"],
+        flux_pooled_prompt_embeds=precomputed_flux_instance["pooled_prompt_embeds"],
+        flux_text_ids=precomputed_flux_instance["text_ids"],
+        class_flux_prompt_embeds=None if precomputed_flux_class is None else precomputed_flux_class["prompt_embeds"],
+        class_flux_pooled_prompt_embeds=None if precomputed_flux_class is None else precomputed_flux_class["pooled_prompt_embeds"],
+        class_flux_text_ids=None if precomputed_flux_class is None else precomputed_flux_class["text_ids"],
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -924,15 +1017,9 @@ def main(args):
         power=cfg.lr_power,
     )
 
-    # Prepare everything with our `accelerator`.
-    if cfg.train_text_encoder:
-        unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder, optimizer, train_dataloader, lr_scheduler
-        )
-    else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
-        )
+    transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        transformer, optimizer, train_dataloader, lr_scheduler
+    )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / cfg.gradient_accumulation_steps)
@@ -1021,80 +1108,87 @@ def main(args):
 
     final_state = False
 
+    vae_config_shift_factor = getattr(vae.config, "shift_factor", 0.0)
+    vae_config_scaling_factor = getattr(vae.config, "scaling_factor", 0.18215)
+    vae_config_block_out_channels = vae.config.block_out_channels
+
+    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+        schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
+        timesteps = timesteps.to(accelerator.device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
     for epoch in range(first_epoch, cfg.num_train_epochs):
-        #print("Epoch", epoch)
-        unet.train()
+        transformer.train()
         avg_combined_loss = []; avg_id_loss = []; avg_instance_loss = []; avg_prior_loss = []
-        
-        if cfg.train_text_encoder:
-            text_encoder.train()
+
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet):
+            with accelerator.accumulate(transformer):
                 pixel_values = batch["pixel_values"].to(dtype=weight_dtype) # shape [2,3,512,512]
                 gt_arcface_embed = batch["identity_embed"].to(dtype=weight_dtype) # shape [2,512]
-                
-                if vae is not None:
-                    # Convert images to latent space
-                    model_input = vae.encode(pixel_values).latent_dist.sample()
-                    model_input = model_input * vae.config.scaling_factor
-                else:
-                    model_input = pixel_values
+
+                model_input = vae.encode(pixel_values).latent_dist.sample()
+                model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
+                model_input = model_input.to(dtype=weight_dtype)
+
+                vae_scale_factor = 2 ** (len(vae_config_block_out_channels) - 1)
+                latent_image_ids = FluxPipeline._prepare_latent_image_ids(
+                    model_input.shape[0],
+                    model_input.shape[2],
+                    model_input.shape[3],
+                    accelerator.device,
+                    weight_dtype,
+                )
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
-                bsz, channels, height, width = model_input.shape
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
-                )
-                #timesteps[0] = 0 # TODO
-                timesteps = timesteps.long()
-                
-                # Add noise to the model input according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
+                bsz = model_input.shape[0]
+                indices = torch.randint(0, noise_scheduler_copy.config.num_train_timesteps, (bsz,), device=model_input.device)
+                schedule_timesteps = noise_scheduler_copy.timesteps.to(device=model_input.device)
+                timesteps = schedule_timesteps[indices]
+                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
 
-                # Get the text embedding for conditioning
-                if cfg.pre_compute_text_embeddings:
-                    encoder_hidden_states = batch["input_ids"]
-                else:
-                    encoder_hidden_states = encode_prompt(
-                        text_encoder,
-                        batch["input_ids"],
-                        batch["attention_mask"],
-                        text_encoder_use_attention_mask=cfg.text_encoder_use_attention_mask,
-                    )
-
-                if unwrap_model(unet).config.in_channels == channels * 2:
-                    noisy_model_input = torch.cat([noisy_model_input, noisy_model_input], dim=1)
-
-                if cfg.class_labels_conditioning == "timesteps":
-                    class_labels = timesteps
-                else:
-                    class_labels = None
-
-                # Predict the noise residual
-                model_pred = unet(
+                packed_noisy_model_input = FluxPipeline._pack_latents(
                     noisy_model_input,
-                    timesteps,
-                    encoder_hidden_states,
-                    class_labels=class_labels,
+                    batch_size=model_input.shape[0],
+                    num_channels_latents=model_input.shape[1],
+                    height=model_input.shape[2],
+                    width=model_input.shape[3],
+                )
+
+                prompt_embeds = batch["prompt_embeds"].to(device=accelerator.device, dtype=weight_dtype)
+                pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(device=accelerator.device, dtype=weight_dtype)
+                text_ids = batch["text_ids"].to(device=accelerator.device, dtype=weight_dtype)
+
+                if unwrap_model(transformer).config.guidance_embeds:
+                    guidance = torch.tensor([getattr(cfg, "guidance_scale", 3.5)], device=accelerator.device)
+                    guidance = guidance.expand(model_input.shape[0])
+                else:
+                    guidance = None
+
+                model_pred = transformer(
+                    hidden_states=packed_noisy_model_input,
+                    timestep=timesteps / 1000,
+                    guidance=guidance,
+                    pooled_projections=pooled_prompt_embeds,
+                    encoder_hidden_states=prompt_embeds,
+                    txt_ids=text_ids,
+                    img_ids=latent_image_ids,
                     return_dict=False,
                 )[0]
+                model_pred = unpack_flux_latents(
+                    model_pred,
+                    latent_height=model_input.shape[2],
+                    latent_width=model_input.shape[3],
+                )
 
-                # if model predicts variance, throw away the prediction. we will only train on the
-                # simplified training objective. This means that all schedulers using the fine tuned
-                # model must be configured to use one of the fixed variance variance types.
-                if model_pred.shape[1] == 6:
-                    model_pred, _ = torch.chunk(model_pred, 2, dim=1)
-
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(model_input, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                target = noise - model_input
 
 
                 """
@@ -1104,6 +1198,8 @@ def main(args):
                     # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
+                    noise_instance, _ = torch.chunk(noise, 2, dim=0)
+                    timestep_instance = timesteps[0]
 
                     # Compute instance loss
                     instance_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -1114,8 +1210,7 @@ def main(args):
 
                     #print(cfg.with_identity_loss)
                     if cfg.which_loss == "identity": 
-                                                
-                        latent_x0 = noise_scheduler.step(model_pred, timesteps[0], noisy_model_input[0]).pred_original_sample
+                        latent_x0 = (noise_instance - model_pred)[0:1]
                         
                         # Perform face detection first 
                         img = latents_to_image_for_mtcnn(latent_x0.to(weight_dtype), vae) 
@@ -1134,7 +1229,7 @@ def main(args):
                             
                             identity_loss = 1 - arcface_cos_similarity #((1 - arcface_cos_similarity) + (1 - arcface_cos_similarity_prior)) / 2 # TODO check is this ok                         
 
-                            identity_noise_level_weight = (1 - timesteps[0] / noise_scheduler.config.num_train_timesteps) ** 2
+                            identity_noise_level_weight = (1 - timestep_instance / noise_scheduler_copy.config.num_train_timesteps) ** 2
                             if not cfg.timestep_loss_weighting: identity_noise_level_weight = 1 
                             
                             loss = loss + identity_noise_level_weight * identity_loss
@@ -1142,8 +1237,7 @@ def main(args):
                         #    print("not detected", timesteps[0])
                     
                     if cfg.which_loss == "triplet_prior": 
-                        
-                        latent_x0 = noise_scheduler.step(model_pred, timesteps[0], noisy_model_input[0]).pred_original_sample
+                        latent_x0 = (noise_instance - model_pred)[0:1]
                         
                         #print(latent_x0)
                         
@@ -1163,7 +1257,7 @@ def main(args):
                             img_cropped = cropped_image_to_arcface_input(img_cropped)
                             pred_arcface_features = arcface_model(img_cropped)
                             
-                            identity_noise_level_weight = (1 - timesteps[0] / noise_scheduler.config.num_train_timesteps)  ** 2
+                            identity_noise_level_weight = (1 - timestep_instance / noise_scheduler_copy.config.num_train_timesteps)  ** 2
                             if not cfg.timestep_loss_weighting: identity_noise_level_weight = 1 
 
                             # input: anchor, positive, negative
@@ -1177,7 +1271,7 @@ def main(args):
                 accelerator.backward(loss)  
 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(params_to_optimize, cfg.max_grad_norm)
+                    accelerator.clip_grad_norm_(transformer.parameters(), cfg.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -1244,23 +1338,18 @@ def main(args):
 
         if accelerator.is_main_process:
             if cfg.validation_prompt is not None and (epoch + 1) % cfg.validation_epochs == 0:
-                # create pipeline
-                pipeline = DiffusionPipeline.from_pretrained(
+                pipeline = FluxPipeline.from_pretrained(
                     cfg.pretrained_model_name_or_path,
-                    unet=unwrap_base_model(unet),
-                    text_encoder=None if cfg.pre_compute_text_embeddings else unwrap_base_model(text_encoder),
+                    transformer=unwrap_model(transformer),
+                    text_encoder=None,
+                    text_encoder_2=None,
                     revision=cfg.revision,
                     variant=cfg.variant,
                     torch_dtype=weight_dtype,
                 )
+                configure_flux_inference_memory(pipeline, accelerator)
 
-                if cfg.pre_compute_text_embeddings:
-                    pipeline_args = {
-                        "prompt_embeds": validation_prompt_encoder_hidden_states,
-                        "negative_prompt_embeds": validation_prompt_negative_prompt_embeds,
-                    }
-                else:
-                    pipeline_args = {"prompt": cfg.validation_prompt}
+                pipeline_args = prepare_flux_validation_kwargs(validation_flux_prompt, accelerator, weight_dtype)
 
                 images = log_validation(
                     pipeline,
@@ -1277,35 +1366,26 @@ def main(args):
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet = unwrap_model(unet)
-        unet = unet.to(torch.float32)
+        transformer = unwrap_model(transformer)
+        transformer = transformer.to(torch.float32)
 
-        unet_lora_state_dict = convert_peft_state_dict_for_diffusers(get_peft_model_state_dict(unet), "unet")
+        transformer_lora_state_dict = convert_peft_state_dict_for_flux(get_peft_model_state_dict(transformer))
 
-        if cfg.train_text_encoder:
-            text_encoder = unwrap_model(text_encoder)
-            text_encoder_state_dict = convert_peft_state_dict_for_diffusers(
-                get_peft_model_state_dict(text_encoder), "text_encoder"
-            )
-        else:
-            text_encoder_state_dict = None
-
-        LoraLoaderMixin.save_lora_weights(
+        FluxPipeline.save_lora_weights(
             save_directory=args.output_dir,
-            unet_lora_layers=unet_lora_state_dict,
-            text_encoder_lora_layers=text_encoder_state_dict,
-        )
-
-        # Final inference
-        # Load previous pipeline
-        pipeline = DiffusionPipeline.from_pretrained(
-            cfg.pretrained_model_name_or_path, revision=cfg.revision, variant=cfg.variant, torch_dtype=weight_dtype
+            transformer_lora_layers=transformer_lora_state_dict,
+            text_encoder_lora_layers=None,
         )
 
         # load attention processors
         lora_loaded_for_inference = True
         try:
-            pipeline.load_lora_weights(args.output_dir, weight_name="pytorch_lora_weights.safetensors")
+            pipeline = build_flux_inference_pipeline(
+                accelerator,
+                weight_dtype=weight_dtype,
+                lora_dir=args.output_dir,
+                lora_weight_name="pytorch_lora_weights.safetensors",
+            )
         except Exception as error:
             lora_loaded_for_inference = False
             logger.warning(
@@ -1316,7 +1396,7 @@ def main(args):
         # run inference
         images = []
         if lora_loaded_for_inference and cfg.validation_prompt and cfg.num_validation_images > 0:
-            pipeline_args = {"prompt": cfg.validation_prompt, "num_inference_steps": 30}
+            pipeline_args = prepare_flux_validation_kwargs(validation_flux_prompt, accelerator, weight_dtype)
             images = log_validation(
                 pipeline,
                 args,
@@ -1333,6 +1413,10 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
+
+    if args.test_run:
+        cfg.num_train_epochs = 1
+        cfg.max_train_steps = None
 
     id_folders = os.listdir(cfg.source_folder)
     
@@ -1369,12 +1453,12 @@ if __name__ == "__main__":
             json.dump(all_args, fp, indent=4)
         
         id_folders.sort(key=natural_keys)
-        id_limit = 0 # 5 # TODO  
+        id_limit = 1 if args.test_run else int(os.environ.get("ID_BOOTH_MAX_IDENTITIES", "0"))
         for i, id_folder in enumerate(id_folders): 
             print(id_folder)
-            if id_limit != 0 and i > id_limit: 
+            if id_limit != 0 and i >= id_limit:
                 print(f"Limit training to {id_limit} identities.")
-                continue 
+                break
             
             cfg.instance_data_dir = os.path.join(cfg.source_folder, id_folder) # "./DATASETS/TUFTS_TEST_512/images_id_1"
             args.output_dir = os.path.join(output_folder, id_folder) 
